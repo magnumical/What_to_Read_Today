@@ -46,7 +46,7 @@ The JSON must follow this exact structure:
 Always provide exactly 3 suggestions for each category. Return ONLY the raw JSON object, nothing else.`;
 
     const stream = await openai.chat.completions.create({
-      model: "gpt-4",
+      model: "gpt-3.5-turbo", // Fastest and most cost-effective option
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: `How are you feeling? ${feeling}` },
@@ -62,6 +62,48 @@ Always provide exactly 3 suggestions for each category. Return ONLY the raw JSON
       async start(controller) {
         let fullContent = '';
         let stage = 'analyzing'; // analyzing -> books -> meals -> activities -> done
+        let sentBooks = false;
+        let sentMeals = false;
+        let sentActivities = false;
+
+        // Helper function to extract JSON array from partial content
+        const extractArray = (content: string, key: string): Recommendation[] | null => {
+          try {
+            const keyIndex = content.indexOf(`"${key}"`);
+            if (keyIndex === -1) return null;
+            
+            // Find the array start after the key
+            const arrayStart = content.indexOf('[', keyIndex);
+            if (arrayStart === -1) return null;
+            
+            // Find matching closing bracket
+            let bracketCount = 0;
+            let arrayEnd = -1;
+            for (let i = arrayStart; i < content.length; i++) {
+              if (content[i] === '[') bracketCount++;
+              if (content[i] === ']') bracketCount--;
+              if (bracketCount === 0) {
+                arrayEnd = i;
+                break;
+              }
+            }
+            
+            if (arrayEnd === -1) return null;
+            
+            // Try to parse the array
+            const arrayStr = content.substring(arrayStart, arrayEnd + 1);
+            const parsed = JSON.parse(arrayStr);
+            
+            // Check if we have 3 complete items
+            if (Array.isArray(parsed) && parsed.length === 3 && 
+                parsed.every((item: any) => item.title && item.reason)) {
+              return parsed;
+            }
+          } catch {
+            // Not ready yet
+          }
+          return null;
+        };
 
         try {
           // Send initial progress
@@ -72,21 +114,42 @@ Always provide exactly 3 suggestions for each category. Return ONLY the raw JSON
             if (content) {
               fullContent += content;
               
-              // Send progress updates based on content
-              if (stage === 'analyzing' && fullContent.includes('"books"')) {
-                stage = 'books';
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'progress', stage: 'books', message: 'Finding books...' })}\n\n`));
-              } else if (stage === 'books' && fullContent.includes('"meals"')) {
-                stage = 'meals';
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'progress', stage: 'meals', message: 'Finding meals...' })}\n\n`));
-              } else if (stage === 'meals' && fullContent.includes('"activities"')) {
-                stage = 'activities';
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'progress', stage: 'activities', message: 'Finding activities...' })}\n\n`));
+              // Try to extract and send books section when complete
+              if (!sentBooks) {
+                const books = extractArray(fullContent, 'books');
+                if (books) {
+                  sentBooks = true;
+                  stage = 'books';
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'progress', stage: 'books', message: 'Finding books...' })}\n\n`));
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'partial', section: 'books', data: books })}\n\n`));
+                }
+              }
+              
+              // Try to extract and send meals section when complete
+              if (sentBooks && !sentMeals) {
+                const meals = extractArray(fullContent, 'meals');
+                if (meals) {
+                  sentMeals = true;
+                  stage = 'meals';
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'progress', stage: 'meals', message: 'Finding meals...' })}\n\n`));
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'partial', section: 'meals', data: meals })}\n\n`));
+                }
+              }
+              
+              // Try to extract and send activities section when complete
+              if (sentMeals && !sentActivities) {
+                const activities = extractArray(fullContent, 'activities');
+                if (activities) {
+                  sentActivities = true;
+                  stage = 'activities';
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'progress', stage: 'activities', message: 'Finding activities...' })}\n\n`));
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'partial', section: 'activities', data: activities })}\n\n`));
+                }
               }
             }
           }
 
-          // Parse the complete JSON
+          // Parse the complete JSON as fallback
           let jsonContent = fullContent.trim();
           
           // Remove markdown code blocks if present
@@ -106,12 +169,18 @@ Always provide exactly 3 suggestions for each category. Return ONLY the raw JSON
           
           const recommendations: Recommendations = JSON.parse(jsonContent);
 
-          // Validate structure
-          if (!recommendations.books || !recommendations.meals || !recommendations.activities) {
-            throw new Error('Invalid response structure');
+          // Send any missing sections
+          if (!sentBooks && recommendations.books) {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'partial', section: 'books', data: recommendations.books })}\n\n`));
+          }
+          if (!sentMeals && recommendations.meals) {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'partial', section: 'meals', data: recommendations.meals })}\n\n`));
+          }
+          if (!sentActivities && recommendations.activities) {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'partial', section: 'activities', data: recommendations.activities })}\n\n`));
           }
 
-          // Send the final result
+          // Send the final complete result
           controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'complete', data: recommendations })}\n\n`));
           controller.close();
         } catch (error: any) {
